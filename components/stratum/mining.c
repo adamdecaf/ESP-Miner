@@ -15,38 +15,55 @@ void free_bm_job(bm_job *job)
 char *construct_coinbase_tx(const char *coinbase_1, const char *coinbase_2,
                             const char *extranonce, const char *extranonce_2)
 {
-    int coinbase_tx_len = strlen(coinbase_1) + strlen(coinbase_2) + strlen(extranonce) + strlen(extranonce_2) + 1;
+    size_t len1 = strlen(coinbase_1);
+    size_t len2 = strlen(coinbase_2);
+    size_t len3 = strlen(extranonce);
+    size_t len4 = strlen(extranonce_2);
+    size_t total_len = len1 + len2 + len3 + len4 + 1;
 
-    char *coinbase_tx = malloc(coinbase_tx_len);
-    strcpy(coinbase_tx, coinbase_1);
-    strcat(coinbase_tx, extranonce);
-    strcat(coinbase_tx, extranonce_2);
-    strcat(coinbase_tx, coinbase_2);
-    coinbase_tx[coinbase_tx_len - 1] = '\0';
+    char *coinbase_tx = malloc(total_len);
+    char *ptr = coinbase_tx;
+
+    memcpy(ptr, coinbase_1, len1);
+    ptr += len1;
+    memcpy(ptr, extranonce, len3);
+    ptr += len3;
+    memcpy(ptr, extranonce_2, len4);
+    ptr += len4;
+    memcpy(ptr, coinbase_2, len2);
+    ptr += len2;
+    *ptr = '\0';
 
     return coinbase_tx;
+}
+
+static inline void double_sha256_bin_buf(const uint8_t *input, size_t len, uint8_t *output) {
+    uint8_t temp_buffer[32];
+    mbedtls_sha256(input, len, temp_buffer, 0);
+    mbedtls_sha256(temp_buffer, 32, output, 0);
 }
 
 char *calculate_merkle_root_hash(const char *coinbase_tx, const uint8_t merkle_branches[][32], const int num_merkle_branches)
 {
     size_t coinbase_tx_bin_len = strlen(coinbase_tx) / 2;
     uint8_t *coinbase_tx_bin = malloc(coinbase_tx_bin_len);
+    uint8_t both_merkles[64];
+    uint8_t hash_buffer[32];  // Reusable buffer for new_root
+    char *merkle_root_hash = malloc(65);
+
     hex2bin(coinbase_tx, coinbase_tx_bin, coinbase_tx_bin_len);
 
-    uint8_t both_merkles[64];
-    uint8_t *new_root = double_sha256_bin(coinbase_tx_bin, coinbase_tx_bin_len);
+    // Initial hash
+    double_sha256_bin_buf(coinbase_tx_bin, coinbase_tx_bin_len, both_merkles);
     free(coinbase_tx_bin);
-    memcpy(both_merkles, new_root, 32);
-    free(new_root);
-    for (int i = 0; i < num_merkle_branches; i++)
-    {
+
+    // Process merkle branches
+    for (int i = 0; i < num_merkle_branches; i++) {
         memcpy(both_merkles + 32, merkle_branches[i], 32);
-        uint8_t *new_root = double_sha256_bin(both_merkles, 64);
-        memcpy(both_merkles, new_root, 32);
-        free(new_root);
+        double_sha256_bin_buf(both_merkles, 64, hash_buffer);
+        memcpy(both_merkles, hash_buffer, 32);
     }
 
-    char *merkle_root_hash = malloc(65);
     bin2hex(both_merkles, 32, merkle_root_hash, 65);
     return merkle_root_hash;
 }
@@ -55,6 +72,7 @@ char *calculate_merkle_root_hash(const char *coinbase_tx, const uint8_t merkle_b
 bm_job construct_bm_job(mining_notify *params, const char *merkle_root, const uint32_t version_mask)
 {
     bm_job new_job;
+    uint8_t midstate_data[64] = {0};
 
     new_job.version = params->version;
     new_job.starting_nonce = 0;
@@ -62,48 +80,46 @@ bm_job construct_bm_job(mining_notify *params, const char *merkle_root, const ui
     new_job.ntime = params->ntime;
     new_job.pool_diff = params->difficulty;
 
+    // Optimize endianness conversions by doing them once
     hex2bin(merkle_root, new_job.merkle_root, 32);
-
-    // hex2bin(merkle_root, new_job.merkle_root_be, 32);
-    swap_endian_words(merkle_root, new_job.merkle_root_be);
+    memcpy(new_job.merkle_root_be, new_job.merkle_root, 32);
     reverse_bytes(new_job.merkle_root_be, 32);
 
-    swap_endian_words(params->prev_block_hash, new_job.prev_block_hash);
-
-    hex2bin(params->prev_block_hash, new_job.prev_block_hash_be, 32);
+    hex2bin(params->prev_block_hash, new_job.prev_block_hash, 32);
+    memcpy(new_job.prev_block_hash_be, new_job.prev_block_hash, 32);
     reverse_bytes(new_job.prev_block_hash_be, 32);
 
-    ////make the midstate hash
-    uint8_t midstate_data[64];
+    // Prepare midstate data
+    memcpy(midstate_data, &new_job.version, 4);
+    memcpy(midstate_data + 4, new_job.prev_block_hash, 32);
+    memcpy(midstate_data + 36, new_job.merkle_root, 28);
 
-    // copy 68 bytes header data into midstate (and deal with endianess)
-    memcpy(midstate_data, &new_job.version, 4);             // copy version
-    memcpy(midstate_data + 4, new_job.prev_block_hash, 32); // copy prev_block_hash
-    memcpy(midstate_data + 36, new_job.merkle_root, 28);    // copy merkle_root
+    // Calculate midstates
+    if (version_mask != 0) {
+        uint32_t rolled_version = new_job.version;
+        uint32_t versions[4] = {
+            rolled_version,
+            increment_bitmask(rolled_version, version_mask),
+            increment_bitmask(rolled_version, version_mask),
+            increment_bitmask(rolled_version, version_mask)
+        };
 
-    midstate_sha256_bin(midstate_data, 64, new_job.midstate); // make the midstate hash
-    reverse_bytes(new_job.midstate, 32);                      // reverse the midstate bytes for the BM job packet
+        uint8_t *midstates[4] = {
+            new_job.midstate,
+            new_job.midstate1,
+            new_job.midstate2,
+            new_job.midstate3
+        };
 
-    if (version_mask != 0)
-    {
-        uint32_t rolled_version = increment_bitmask(new_job.version, version_mask);
-        memcpy(midstate_data, &rolled_version, 4);
-        midstate_sha256_bin(midstate_data, 64, new_job.midstate1);
-        reverse_bytes(new_job.midstate1, 32);
-
-        rolled_version = increment_bitmask(rolled_version, version_mask);
-        memcpy(midstate_data, &rolled_version, 4);
-        midstate_sha256_bin(midstate_data, 64, new_job.midstate2);
-        reverse_bytes(new_job.midstate2, 32);
-
-        rolled_version = increment_bitmask(rolled_version, version_mask);
-        memcpy(midstate_data, &rolled_version, 4);
-        midstate_sha256_bin(midstate_data, 64, new_job.midstate3);
-        reverse_bytes(new_job.midstate3, 32);
+        for (int i = 0; i < 4; i++) {
+            memcpy(midstate_data, &versions[i], 4);
+            midstate_sha256_bin(midstate_data, 64, midstates[i]);
+            reverse_bytes(midstates[i], 32);
+        }
         new_job.num_midstates = 4;
-    }
-    else
-    {
+    } else {
+        midstate_sha256_bin(midstate_data, 64, new_job.midstate);
+        reverse_bytes(new_job.midstate, 32);
         new_job.num_midstates = 1;
     }
 
